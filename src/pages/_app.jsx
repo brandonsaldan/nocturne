@@ -10,6 +10,7 @@ import {
   fetchUserRadio,
 } from "../services";
 import ErrorAlert from "../components/ErrorAlert";
+import AuthMethodSelector from "../components/AuthMethodSelector";
 
 const inter = Inter({ subsets: ["latin", "latin-ext"] });
 
@@ -88,6 +89,49 @@ export default function App({ Component, pageProps }) {
   const [currentPlayback, setCurrentPlayback] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [error, setError] = useState(null);
+  const [authMethod, setAuthMethod] = useState(null);
+  const [customCredentials, setCustomCredentials] = useState(null);
+
+  useEffect(() => {
+    const useCustomCredentials =
+      localStorage.getItem("useCustomCredentials") === "true";
+    if (useCustomCredentials) {
+      const encodedCredentials = localStorage.getItem("customCredentials");
+      if (encodedCredentials) {
+        try {
+          const decodedCredentials = atob(encodedCredentials);
+          const parsedCredentials = JSON.parse(decodedCredentials);
+          setCustomCredentials(parsedCredentials);
+        } catch (error) {
+          console.error("Error decoding stored credentials:", error);
+          localStorage.removeItem("customCredentials");
+          localStorage.removeItem("useCustomCredentials");
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authCode) {
+      fetchAccessToken(authCode);
+    } else if (
+      typeof window !== "undefined" &&
+      !window.location.search.includes("code") &&
+      !authMethod
+    ) {
+      setAuthMethod({ showSelector: true });
+    }
+  }, [authCode, authMethod]);
+
+  useEffect(() => {
+    if (authMethod && !authMethod.showSelector) {
+      if (authMethod.useDefault) {
+        redirectToSpotify();
+      } else {
+        redirectToSpotify(customCredentials);
+      }
+    }
+  }, [authMethod, customCredentials]);
 
   const handleError = (errorType, errorMessage) => {
     setError({
@@ -142,8 +186,17 @@ export default function App({ Component, pageProps }) {
 
   useEffect(() => {
     if (typeof window !== "undefined") {
-      const code = new URLSearchParams(window.location.search).get("code");
-      setAuthCode(code);
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get("code");
+      const state = urlParams.get("state");
+      const storedState = localStorage.getItem("spotify_auth_state");
+
+      if (code && state === storedState) {
+        localStorage.removeItem("spotify_auth_state");
+        fetchAccessToken(code);
+      } else if (state !== storedState) {
+        console.error("State mismatch in OAuth flow");
+      }
     }
   }, []);
 
@@ -152,11 +205,17 @@ export default function App({ Component, pageProps }) {
       fetchAccessToken(authCode);
     } else if (
       typeof window !== "undefined" &&
-      !window.location.search.includes("code")
+      !window.location.search.includes("code") &&
+      authMethod &&
+      !authMethod.showSelector
     ) {
-      redirectToSpotify();
+      if (authMethod.useDefault) {
+        redirectToSpotify();
+      } else {
+        redirectToSpotify(customCredentials);
+      }
     }
-  }, [authCode]);
+  }, [authCode, authMethod, customCredentials]);
 
   useEffect(() => {
     if (accessToken) {
@@ -276,59 +335,6 @@ export default function App({ Component, pageProps }) {
     }
   };
 
-  const redirectToSpotify = () => {
-    const scopes =
-      "user-read-recently-played user-read-private user-top-read user-read-playback-state user-modify-playback-state user-read-currently-playing user-library-read user-library-modify playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private";
-
-    window.location.href = `https://accounts.spotify.com/authorize?client_id=${process.env.NEXT_PUBLIC_SPOTIFY_CLIENT_ID}&response_type=code&redirect_uri=${process.env.NEXT_PUBLIC_REDIRECT_URI}&scope=${scopes}`;
-  };
-
-  const fetchAccessToken = async (code) => {
-    try {
-      const response = await fetch("/api/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ code }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      setAccessToken(data.access_token);
-      setRefreshToken(data.refresh_token);
-    } catch (error) {
-      handleError("FETCH_ACCESS_TOKEN_ERROR", error.message);
-    }
-  };
-
-  const refreshAccessToken = async () => {
-    try {
-      const response = await fetch("/api/refresh-token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      setAccessToken(data.access_token);
-      if (data.refresh_token) {
-        setRefreshToken(data.refresh_token);
-      }
-    } catch (error) {
-      handleError("REFRESH_ACCESS_TOKEN_ERROR", error.message);
-    }
-  };
-
   const calculateBrightness = (hex) => {
     const r = parseInt(hex.slice(1, 3), 16);
     const g = parseInt(hex.slice(3, 5), 16);
@@ -431,6 +437,138 @@ export default function App({ Component, pageProps }) {
       }
     }
   }, [router.pathname, currentPlayback]);
+
+  const handleAuthMethodSelected = (method) => {
+    setAuthMethod(method);
+    if (method.useDefault) {
+      setCustomCredentials(null);
+      localStorage.removeItem("customCredentials");
+      localStorage.setItem("useCustomCredentials", "false");
+    } else {
+      const credentials = {
+        clientId: method.clientId,
+        clientSecret: method.clientSecret,
+      };
+      setCustomCredentials(credentials);
+      const encodedCredentials = btoa(JSON.stringify(credentials));
+      localStorage.setItem("customCredentials", encodedCredentials);
+      localStorage.setItem("useCustomCredentials", "true");
+    }
+  };
+
+  const redirectToSpotify = useCallback(() => {
+    const scopes =
+      "user-read-recently-played user-read-private user-top-read user-read-playback-state user-modify-playback-state user-read-currently-playing user-library-read user-library-modify playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private";
+
+    const clientId = customCredentials
+      ? customCredentials.clientId
+      : process.env.NEXT_PUBLIC_SPOTIFY_CLIENT_ID;
+
+    const state = Math.random().toString(36).substring(7);
+    localStorage.setItem("spotify_auth_state", state);
+    localStorage.setItem(
+      "useCustomCredentials",
+      customCredentials ? "true" : "false"
+    );
+
+    window.location.href = `https://accounts.spotify.com/authorize?client_id=${encodeURIComponent(
+      clientId
+    )}&response_type=code&redirect_uri=${encodeURIComponent(
+      process.env.NEXT_PUBLIC_REDIRECT_URI
+    )}&scope=${encodeURIComponent(scopes)}&state=${state}`;
+  }, [customCredentials]);
+
+  const fetchAccessToken = useCallback(
+    async (code) => {
+      try {
+        const useCustomCredentials =
+          localStorage.getItem("useCustomCredentials") === "true";
+        let credentials = null;
+
+        if (useCustomCredentials) {
+          const encodedCredentials = localStorage.getItem("customCredentials");
+          if (encodedCredentials) {
+            try {
+              const decodedCredentials = atob(encodedCredentials);
+              credentials = JSON.parse(decodedCredentials);
+            } catch (error) {
+              console.error("Error decoding stored credentials:", error);
+              localStorage.removeItem("customCredentials");
+              localStorage.removeItem("useCustomCredentials");
+            }
+          }
+        }
+
+        const body = {
+          code,
+          useCustomCredentials,
+          ...(useCustomCredentials &&
+            credentials && {
+              clientId: credentials.clientId,
+              clientSecret: credentials.clientSecret,
+            }),
+        };
+
+        const response = await fetch("/api/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(
+            data.details || `HTTP error! status: ${response.status}`
+          );
+        }
+
+        setAccessToken(data.access_token);
+        setRefreshToken(data.refresh_token);
+
+        setCustomCredentials(null);
+        localStorage.removeItem("customCredentials");
+        localStorage.removeItem("useCustomCredentials");
+      } catch (error) {
+        console.error("Error fetching access token:", error);
+        handleError("FETCH_ACCESS_TOKEN_ERROR", error.message);
+      }
+    },
+    [handleError]
+  );
+
+  useEffect(() => {
+    return () => {
+      localStorage.removeItem("customCredentials");
+      localStorage.removeItem("useCustomCredentials");
+    };
+  }, []);
+
+  const refreshAccessToken = async () => {
+    try {
+      const response = await fetch("/api/refresh-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      setAccessToken(data.access_token);
+      if (data.refresh_token) {
+        setRefreshToken(data.refresh_token);
+      }
+    } catch (error) {
+      handleError("REFRESH_ACCESS_TOKEN_ERROR", error.message);
+    }
+  };
 
   const updateGradientColors = useCallback(
     (imageUrl, section = null) => {
@@ -600,6 +738,18 @@ export default function App({ Component, pageProps }) {
       setTargetColor4(color4);
     }
   }, [activeSection, sectionGradients]);
+
+  if (!accessToken && !authCode && authMethod?.showSelector) {
+    return (
+      <main
+        className={`overflow-hidden relative min-h-screen bg-black ${inter.className}`}
+      >
+        <div className="relative z-10">
+          <AuthMethodSelector onAuthMethodSelected={handleAuthMethodSelected} />
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main
